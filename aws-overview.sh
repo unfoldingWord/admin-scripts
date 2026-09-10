@@ -8,8 +8,12 @@
 #   ./aws-overview.sh                    # print everything to screen
 #   ./aws-overview.sh > report.txt       # save the whole run to one file
 #   ./aws-overview.sh -o out             # split output, region-first (see below)
-#   ./aws-overview.sh -o out -r us-west-2 # one region (global section still runs)
+#   ./aws-overview.sh -o out -r "global us-west-2" # global + one region
 #   ./aws-overview.sh -r "us-east-1 eu-west-1"  # limit to specific regions
+#
+# "global" is itself a region here (region-independent services: S3, IAM,
+# Route 53, CloudFront). It is included by default; with -r it runs only if
+# you list it.
 #
 # Split layout (-o/--outdir set), one directory per region:
 #   out/us-east-1/overview.txt        # always written: what was checked + status
@@ -26,13 +30,19 @@ set -euo pipefail
 
 # --- config ---------------------------------------------------------------
 
-# Leave empty to auto-detect all enabled regions.
-# Or set your own list, e.g. REGIONS="us-east-1 eu-west-1"
+# Leave empty to auto-detect: "global" + all enabled regions.
+# Or set your own list, e.g. REGIONS="global us-east-1 eu-west-1"
+# ("global" is a region here — the region-independent services; list it to
+# scan it.)
 REGIONS="${REGIONS:-}"
 
 # Output directory for split mode. Set with -o/--outdir (see arg parsing
 # below). Empty means print everything to stdout.
 OUTDIR=""
+
+# Log verbosity threshold. Messages below this level are dropped.
+# One of: DEBUG, INFO, WARN, ERROR. Set with -l/--log-level or $LOG_LEVEL.
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 usage() {
   cat <<EOF
@@ -42,17 +52,22 @@ Usage: aws-overview.sh [-o DIR] [-r "REGIONS"]
                       (see the layout in this script's header comment).
                       Omit to print everything to stdout.
   -r, --regions LIST  Space-separated regions to scan, e.g. "us-east-1 eu-west-1".
-                      Default: all enabled regions. Overrides \$REGIONS.
-                      The global section (S3, IAM, Route 53, CloudFront) always
-                      runs regardless of this flag.
+                      Default: "global" + all enabled regions. Overrides \$REGIONS.
+                      "global" is a region here (region-independent services:
+                      S3, IAM, Route 53, CloudFront) and runs only if listed,
+                      e.g. -r "global us-west-2".
+  -l, --log-level LVL Log verbosity: DEBUG, INFO, WARN, or ERROR (default INFO).
+                      Logs go to stderr with timestamps and levels. Overrides
+                      \$LOG_LEVEL.
   -h, --help          Show this help and exit.
 
 Examples:
-  aws-overview.sh -o out -r us-west-2          # one region + global, split out
-  aws-overview.sh -r "us-east-1 eu-west-1"     # two regions, to stdout
+  aws-overview.sh -o out -r "global us-west-2" # global + one region, split out
+  aws-overview.sh -r "us-east-1 eu-west-1"     # two regions, no global, stdout
 
 Environment:
-  REGIONS   Same as --regions (the flag wins if both are given).
+  REGIONS     Same as --regions (the flag wins if both are given).
+  LOG_LEVEL   Same as --log-level (the flag wins if both are given).
 EOF
 }
 
@@ -68,6 +83,11 @@ while [ $# -gt 0 ]; do
       REGIONS="$2"; shift 2 ;;
     --regions=*)
       REGIONS="${1#*=}"; shift ;;
+    -l|--log-level)
+      [ $# -ge 2 ] || { echo "Missing value for $1" >&2; exit 2; }
+      LOG_LEVEL="$2"; shift 2 ;;
+    --log-level=*)
+      LOG_LEVEL="${1#*=}"; shift ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -75,20 +95,58 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# --- logging --------------------------------------------------------------
+
+# Numeric rank for a level name, so we can compare against the threshold.
+# Unknown names sort as INFO so a typo never silences everything.
+log_level_num() {
+  case "$1" in
+    DEBUG) echo 10 ;;
+    INFO)  echo 20 ;;
+    WARN)  echo 30 ;;
+    ERROR) echo 40 ;;
+    *)     echo 20 ;;
+  esac
+}
+
+# Emit one log line to stderr (never stdout, so it never pollutes split files
+# or a piped report). Format: "2026-09-10T12:34:56Z [INFO ] message".
+# Dropped if <level> is below $LOG_LEVEL.
+#   log <DEBUG|INFO|WARN|ERROR> <message...>
+log() {
+  local level="$1"; shift
+  [ "$(log_level_num "$level")" -ge "$(log_level_num "$LOG_LEVEL")" ] || return 0
+  printf '%s [%-5s] %s\n' "$(date -u +%FT%TZ)" "$level" "$*" >&2
+}
+
+# Log one resource type's outcome, mirroring what mark() records in
+# overview.txt (status word), plus the resource count when known. The count is
+# omitted for "none"/"no permission" where it would always be 0/undefined.
+#   log_resource <key> <status> [count]
+log_resource() {
+  local key="$1" status="$2" count="${3:-}"
+  local level detail
+  case "$status" in
+    ok)              level="INFO"; detail="ok${count:+ ($count)}" ;;
+    none)            level="INFO"; detail="none" ;;
+    "no permission") level="WARN"; detail="no permission" ;;
+    *)               level="INFO"; detail="$status" ;;
+  esac
+  log "$level" "region=$REGION_NAME $key: $detail"
+}
+
 # --- helpers --------------------------------------------------------------
 
-hr() { printf '%s\n' "--------------------------------------------------------"; }
-
-# Progress/context always goes to stderr so it never pollutes split files.
-note() { echo "$*" >&2; }
-
 # Per-region state (split mode).
+REGION_NAME=""     # current region (or "global"); used in log lines
 REGION_DIR=""      # current region's output directory
 REGION_FILES=""    # comma-separated list of index files written this region
 
 # Begin a region (or the pseudo-region "global").
 region_begin() {
   local region="$1"
+  REGION_NAME="$region"
+  log INFO "region=$region: begin"
   if [ -n "$OUTDIR" ]; then
     REGION_DIR="$OUTDIR/$region"
     REGION_FILES=""
@@ -99,23 +157,22 @@ region_begin() {
       echo "Checked: $(date +%F)"
       echo
     } > "$REGION_DIR/overview.txt"
-  else
-    note ""
-    note "== REGION: $region =="
   fi
 }
 
-# Finish a region: write the overview footer.
+# Finish a region: write the overview footer (split mode) and log the end.
 region_end() {
-  [ -n "$OUTDIR" ] || return 0
-  {
-    echo
-    if [ -z "$REGION_FILES" ]; then
-      echo "No resources found in this region."
-    else
-      echo "Files written: $REGION_FILES"
-    fi
-  } >> "$REGION_DIR/overview.txt"
+  if [ -n "$OUTDIR" ]; then
+    {
+      echo
+      if [ -z "$REGION_FILES" ]; then
+        echo "No resources found in this region."
+      else
+        echo "Files written: $REGION_FILES"
+      fi
+    } >> "$REGION_DIR/overview.txt"
+  fi
+  log INFO "region=$REGION_NAME: end"
 }
 
 # Record a resource type's status in the overview and remember its index file.
@@ -154,6 +211,10 @@ emit_raw() {
     status="no permission"
   fi
 
+  local count=""
+  [ "$status" = "ok" ] && count="$(printf '%s\n' "$out" | grep -c .)"
+  log_resource "$key" "$status" "$count"
+
   if [ -n "$OUTDIR" ]; then
     mark "$key" "$status"
     case "$status" in
@@ -182,9 +243,10 @@ emit_raw() {
 #     json     the full JSON blob whose <list_jq> points at the array
 render() {
   local key="$1" label="$2" list_jq="$3" id_jq="$4" header="$5" row_jq="$6" status="$7" out="$8"
-  local table id elem
+  local table id elem count=""
 
   if [ "$status" = "ok" ]; then
+    count="$(printf '%s' "$out" | jq "($list_jq) | length" 2>/dev/null || echo "")"
     table="$(
       {
         printf '%b\n' "$header"
@@ -192,6 +254,8 @@ render() {
       } | column -t -s "$(printf '\t')"
     )"
   fi
+
+  log_resource "$key" "$status" "$count"
 
   if [ -n "$OUTDIR" ]; then
     mark "$key" "$status"
@@ -417,13 +481,20 @@ emit_account_pab() {
   local key="account-pab" label="Account S3 Public Access Block"
   local header='Account\tBlockPublicAcls\tIgnorePublicAcls\tBlockPublicPolicy\tRestrictPublicBuckets\tAllBlocked'
   local row='.Account, .BlockPublicAcls, .IgnorePublicAcls, .BlockPublicPolicy, .RestrictPublicBuckets, .AllBlocked'
-  local raw rc cfg obj status pab_region
+  local raw rc cfg obj status pab_region r
 
   # s3control is a REGIONAL service (unlike s3api/iam/route53), so the call
   # needs an explicit region even though the account-level PAB it returns is
-  # account-global. Use the first scanned region (partition-safe) rather than
-  # hardcoding us-east-1, which does not exist in GovCloud/China.
-  pab_region="${REGIONS%% *}"; [ -n "$pab_region" ] || pab_region="us-east-1"
+  # account-global. Use the first scanned REAL region (skip the "global"
+  # pseudo-region) — partition-safe, rather than hardcoding us-east-1, which
+  # does not exist in GovCloud/China. Fall back to us-east-1 only if nothing
+  # but "global" was requested.
+  pab_region=""
+  for r in $REGIONS; do
+    [ "$r" = "global" ] && continue
+    pab_region="$r"; break
+  done
+  [ -n "$pab_region" ] || pab_region="us-east-1"
 
   raw="$(aws s3control get-public-access-block --account-id "$ACCOUNT_ID" --region "$pab_region" --output json 2>&1)" && rc=0 || rc=$?
 
@@ -459,62 +530,60 @@ emit_account_pab() {
 
 # --- account context ------------------------------------------------------
 
+log INFO "log level: $LOG_LEVEL"
+
 if [ -n "$OUTDIR" ]; then
   mkdir -p "$OUTDIR"
-  note "Splitting output (region-first) into: $OUTDIR/<region>/"
+  log INFO "split output (region-first) into: $OUTDIR/<region>/"
 fi
 
-note ""
-note "== Account =="
-aws sts get-caller-identity \
-  --query '{Account:Account, Arn:Arn}' --output table >&2
-# Account id, used for account-level calls (e.g. s3control PAB).
-ACCOUNT_ID="$(aws sts get-caller-identity --query 'Account' --output text)"
+# Account identity, used for account-level calls (e.g. s3control PAB). One call
+# yields both fields for the log line.
+identity="$(aws sts get-caller-identity --query '{Account:Account,Arn:Arn}' --output json)"
+ACCOUNT_ID="$(printf '%s' "$identity" | jq -r '.Account')"
+log INFO "account=$ACCOUNT_ID arn=$(printf '%s' "$identity" | jq -r '.Arn')"
 
 # --- region list ----------------------------------------------------------
 
 if [ -z "$REGIONS" ]; then
-  REGIONS="$(aws ec2 describe-regions \
+  # "global" is the pseudo-region for region-independent services (S3, IAM,
+  # Route 53, CloudFront). It leads the default list so it scans first.
+  REGIONS="global $(aws ec2 describe-regions \
     --query 'Regions[].RegionName' --output text)"
 fi
 
-note ""
-note "Regions to scan: $REGIONS"
+log INFO "regions to scan: $REGIONS"
 
-# --- global (region-independent) services ---------------------------------
+# --- scanners -------------------------------------------------------------
 
-note ""
-note "Scanning global services..."
-region_begin global
+# Global (region-independent) services, scanned under the pseudo-region
+# "global": S3, account-level S3 PAB, IAM, Route 53, CloudFront, IAM policies.
+run_global() {
+  emit_s3_detail
 
-emit_s3_detail
+  emit_account_pab
 
-emit_account_pab
+  emit_iam_detail
 
-emit_iam_detail
+  emit route53 "Route 53 hosted zones" '.HostedZones' '(.Id | ltrimstr("/hostedzone/"))' \
+    'ID\tName\tRecords\tPrivate' \
+    '(.Id | ltrimstr("/hostedzone/")), .Name, .ResourceRecordSetCount, .Config.PrivateZone' \
+    aws route53 list-hosted-zones --output json
 
-emit route53 "Route 53 hosted zones" '.HostedZones' '(.Id | ltrimstr("/hostedzone/"))' \
-  'ID\tName\tRecords\tPrivate' \
-  '(.Id | ltrimstr("/hostedzone/")), .Name, .ResourceRecordSetCount, .Config.PrivateZone' \
-  aws route53 list-hosted-zones --output json
+  emit cloudfront "CloudFront distributions" '(.DistributionList.Items // [])' '.Id' \
+    'ID\tDomain\tStatus\tEnabled\tAliases' \
+    '.Id, .DomainName, .Status, .Enabled, ((.Aliases.Items // []) | join(","))' \
+    aws cloudfront list-distributions --output json
 
-emit cloudfront "CloudFront distributions" '(.DistributionList.Items // [])' '.Id' \
-  'ID\tDomain\tStatus\tEnabled\tAliases' \
-  '.Id, .DomainName, .Status, .Enabled, ((.Aliases.Items // []) | join(","))' \
-  aws cloudfront list-distributions --output json
+  emit iam-policies "IAM customer-managed policies" '.Policies' '.PolicyName' \
+    'Name\tAttached\tCreated\tARN' \
+    '.PolicyName, .AttachmentCount, .CreateDate, .Arn' \
+    aws iam list-policies --scope Local --output json
+}
 
-emit iam-policies "IAM customer-managed policies" '.Policies' '.PolicyName' \
-  'Name\tAttached\tCreated\tARN' \
-  '.PolicyName, .AttachmentCount, .CreateDate, .Arn' \
-  aws iam list-policies --scope Local --output json
-
-region_end
-
-# --- per-region loop ------------------------------------------------------
-
-for region in $REGIONS; do
-  note "Scanning region: $region"
-  region_begin "$region"
+# Per-region services for one real AWS region.
+run_region() {
+  local region="$1"
 
   emit_raw tagged "All taggable resources (Tagging API)" \
     tagged_arns "$region"
@@ -659,10 +728,18 @@ for region in $REGIONS; do
     aws kms list-keys --region "$region" --output json \
     -- \
     aws kms describe-key --key-id '{}' --region "$region" --output json
+}
 
+# --- scan loop ------------------------------------------------------------
+
+for region in $REGIONS; do
+  region_begin "$region"
+  if [ "$region" = "global" ]; then
+    run_global
+  else
+    run_region "$region"
+  fi
   region_end
 done
 
-note ""
-hr >&2
-note "Done."
+log INFO "done"
