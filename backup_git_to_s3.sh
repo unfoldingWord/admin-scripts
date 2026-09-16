@@ -69,6 +69,12 @@ TMP_DIR="${TMP_DIR:-/tmp}"
 # List actions instead of performing them. Set with --dry-run.
 DRY_RUN=false
 
+# How often to log a progress line during the upload loop: one INFO line per this
+# many repos processed, plus a final line for the remaining partial batch. Set to
+# 0 to disable progress lines entirely. Env-only (no flag); must be a
+# non-negative integer.
+PROGRESS_EVERY="${PROGRESS_EVERY:-100}"
+
 usage() {
   cat <<EOF
 Usage: backup_git_to_s3.sh [options]
@@ -90,6 +96,8 @@ Usage: backup_git_to_s3.sh [options]
 
 Environment variables mirror the flags (SOURCE_DIR, BUCKET, PREFIX, MARKER,
 MARKER_DIR, STORAGE_CLASS, TMP_DIR); the flag wins if both are given.
+PROGRESS_EVERY (env-only, default 100) logs a progress line every N repos
+processed; set to 0 to disable.
 
 Examples:
   backup_git_to_s3.sh -s /data/git/repositories -b uw-git-backups
@@ -173,6 +181,10 @@ SOURCE_DIR="${SOURCE_DIR%/}"
 # --- preflight ------------------------------------------------------------
 
 [ -n "$BUCKET" ] || { echo "Error: bucket is required (-b/--bucket or \$BUCKET)." >&2; usage >&2; exit 2; }
+
+case "$PROGRESS_EVERY" in
+  ''|*[!0-9]*) echo "Error: PROGRESS_EVERY must be a non-negative integer: $PROGRESS_EVERY" >&2; exit 2 ;;
+esac
 
 # Derive the marker path from the job identity (source, bucket, prefix) unless an
 # explicit --marker/$MARKER was given. The hash means each distinct job gets its
@@ -267,6 +279,15 @@ fi
 
 failures=0
 uploaded=0
+processed=0
+
+# Log a progress line every PROGRESS_EVERY repos processed (0 disables). Called
+# after each repo so the running counts reflect the repo just handled.
+progress_tick() {
+  [ "$PROGRESS_EVERY" -gt 0 ] || return 0
+  (( processed % PROGRESS_EVERY == 0 )) || return 0
+  log INFO "Progress: $processed/$count repos processed ($uploaded uploaded, $failures failed)"
+}
 
 for repo in "${changed[@]}"; do
   # Derive owner/repo from the path so the S3 key mirrors the tree.
@@ -279,32 +300,35 @@ for repo in "${changed[@]}"; do
   if [ "$DRY_RUN" = true ]; then
     log INFO "[dry-run] Would upload $repo -> $s3_uri"
     uploaded=$((uploaded + 1))
-    continue
+  else
+    tarball="$WORK_DIR/repo.tar.gz"
+
+    # tar from the source root with the relative path so the archive contains
+    # "<owner>/<repo>.git/..." rather than absolute paths. -C avoids leading-slash
+    # warnings and keeps archives portable.
+    if ! tar -czf "$tarball" -C "$SOURCE_DIR" -- "$rel" 2>>"$WORK_DIR/tar.err"; then
+      log ERROR "Tar failed for $repo: $(tail -n1 "$WORK_DIR/tar.err" 2>/dev/null)"
+      rm -f "$tarball"
+      failures=$((failures + 1))
+    elif ! aws s3 cp "$tarball" "$s3_uri" --storage-class "$STORAGE_CLASS" >/dev/null 2>>"$WORK_DIR/aws.err"; then
+      log ERROR "Upload failed for $repo -> $s3_uri: $(tail -n1 "$WORK_DIR/aws.err" 2>/dev/null)"
+      rm -f "$tarball"
+      failures=$((failures + 1))
+    else
+      rm -f "$tarball"
+      uploaded=$((uploaded + 1))
+    fi
   fi
 
-  tarball="$WORK_DIR/repo.tar.gz"
-
-  # tar from the source root with the relative path so the archive contains
-  # "<owner>/<repo>.git/..." rather than absolute paths. -C avoids leading-slash
-  # warnings and keeps archives portable.
-  if ! tar -czf "$tarball" -C "$SOURCE_DIR" -- "$rel" 2>>"$WORK_DIR/tar.err"; then
-    log ERROR "Tar failed for $repo: $(tail -n1 "$WORK_DIR/tar.err" 2>/dev/null)"
-    rm -f "$tarball"
-    failures=$((failures + 1))
-    continue
-  fi
-
-  if ! aws s3 cp "$tarball" "$s3_uri" --storage-class "$STORAGE_CLASS" >/dev/null 2>>"$WORK_DIR/aws.err"; then
-    log ERROR "Upload failed for $repo -> $s3_uri: $(tail -n1 "$WORK_DIR/aws.err" 2>/dev/null)"
-    rm -f "$tarball"
-    failures=$((failures + 1))
-    continue
-  fi
-
-  rm -f "$tarball"
-  uploaded=$((uploaded + 1))
-  log INFO "Uploaded $repo -> $s3_uri"
+  processed=$((processed + 1))
+  progress_tick
 done
+
+# Final line for the trailing partial batch (skipped if the last tick already
+# landed exactly on a PROGRESS_EVERY boundary, to avoid a duplicate).
+if [ "$PROGRESS_EVERY" -gt 0 ] && (( processed % PROGRESS_EVERY != 0 )); then
+  log INFO "Progress: $processed/$count repos processed ($uploaded uploaded, $failures failed)"
+fi
 
 # --- marker update + summary ----------------------------------------------
 
