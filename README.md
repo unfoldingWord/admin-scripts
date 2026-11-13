@@ -13,6 +13,7 @@ Each script has its own page under [`docs/`](docs/) with a description, flags, a
 | `find_grafana_usage.py` | Finds Grafana panels and alert rules by datasource type, query regex, panel type, or folder (migration worklists & audits). | [docs](docs/find_grafana_usage.md) |
 | `find_old_files.sh` | Locates or deletes files that haven't been modified since a configurable time. | [docs](docs/find_old_files.md) |
 | `openbao_healthcheck.sh` | End-to-end smoke test of an OpenBao/Vault server: health, userpass login, KV read/write, and policy listing. | [docs](docs/openbao_healthcheck.md) |
+| `send_otlp.sh` | Sends one sample metric to an OTLP/HTTP endpoint as a smoke test (reachability, tenant header, Basic Auth). | [docs](docs/send_otlp.md) |
 
 ## Adding New Scripts
 
