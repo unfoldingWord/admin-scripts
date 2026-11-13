@@ -12,6 +12,7 @@ Each script has its own page under [`docs/`](docs/) with a description, flags, a
 | `backup_git_to_s3.sh` | Incrementally archives changed bare git repos to S3, one `tar.gz` per repo. | [docs](docs/backup_git_to_s3.md) |
 | `find_grafana_usage.py` | Finds Grafana panels and alert rules by datasource type, query regex, panel type, or folder (migration worklists & audits). | [docs](docs/find_grafana_usage.md) |
 | `find_old_files.sh` | Locates or deletes files that haven't been modified since a configurable time. | [docs](docs/find_old_files.md) |
+| `openbao_healthcheck.sh` | End-to-end smoke test of an OpenBao/Vault server: health, userpass login, KV read/write, and policy listing. | [docs](docs/openbao_healthcheck.md) |
 
 ## Adding New Scripts
 
