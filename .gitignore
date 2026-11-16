@@ -2,3 +2,4 @@
 *.txt
 *.out
 __pycache__
+*.csv

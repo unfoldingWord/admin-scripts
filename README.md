@@ -12,6 +12,8 @@ Each script has its own page under [`docs/`](docs/) with a description, flags, a
 | `backup_git_to_s3.sh` | Incrementally archives changed bare git repos to S3, one `tar.gz` per repo. | [docs](docs/backup_git_to_s3.md) |
 | `find_grafana_usage.py` | Finds Grafana panels and alert rules by datasource type, query regex, panel type, or folder (migration worklists & audits). | [docs](docs/find_grafana_usage.md) |
 | `find_old_files.sh` | Locates or deletes files that haven't been modified since a configurable time. | [docs](docs/find_old_files.md) |
+| `gh-members-access.sh` | Lists a GitHub org's owners and members as CSV: name, role, MFA, last activity on the org's repos, and status. | [docs](docs/gh-members-access.md) |
+| `gh-outside-access.sh` | Lists a GitHub org's outside collaborators as CSV, one row per repo: name, MFA, last activity, repo, and permission. | [docs](docs/gh-outside-access.md) |
 | `openbao_healthcheck.sh` | End-to-end smoke test of an OpenBao/Vault server: health, userpass login, KV read/write, and policy listing. | [docs](docs/openbao_healthcheck.md) |
 | `send_otlp.sh` | Sends one sample metric to an OTLP/HTTP endpoint as a smoke test (reachability, tenant header, Basic Auth). | [docs](docs/send_otlp.md) |
 
